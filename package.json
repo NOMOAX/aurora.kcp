@@ -1,0 +1,20 @@
+{
+  "name": "com.kevin-games.aurora.kcp",
+  "displayName": "Aurora KCP",
+  "version": "0.1.0",
+  "unity": "2021.2",
+  "description": "KCP ARQ protocol: trades 10%-20% of extra bandwidth for an average latency 30%-40% lower than TCP.\n\nDependencies:\n- Aurora (https://github.com/NOMOAX/aurora.git)",
+  "keywords": [
+    "aurora",
+    "kcp",
+    "network"
+  ],
+  "dependencies": {
+    "com.kevin-games.aurora": "2.0.0"
+  },
+  "author": {
+    "name": "Kevin Games",
+    "email": "844038603@qq.com",
+    "url": "https://github.com/NOMOAX"
+  }
+}

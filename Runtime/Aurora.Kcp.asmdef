@@ -1,0 +1,16 @@
+{
+    "name": "Aurora.Kcp",
+    "rootNamespace": "Aurora.Kcp",
+    "references": [
+        "Aurora"
+    ],
+    "includePlatforms": [],
+    "excludePlatforms": [],
+    "allowUnsafeCode": false,
+    "overrideReferences": false,
+    "precompiledReferences": [],
+    "autoReferenced": true,
+    "defineConstraints": [],
+    "versionDefines": [],
+    "noEngineReferences": true
+}
