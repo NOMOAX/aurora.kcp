@@ -1,7 +1,7 @@
 # Aurora KCP
 
 ![license](https://img.shields.io/github/license/NOMOAX/aurora.kcp)
-![version](https://img.shields.io/badge/version-0.1.0-blue)
+![version](https://img.shields.io/badge/version-0.1.1-blue)
 ![lowest Unity version](https://img.shields.io/badge/Unity-2021.2%2B-blue)
 
 KCP is a fast and reliable ARQ (Automatic Repeat reQuest) protocol: it trades 10%-20% of extra bandwidth for an average latency 30%-40% lower than TCP.
@@ -139,7 +139,7 @@ kcp.SetNoDelay(KcpNoDelayLevel.Enabled, 10, 2, true);
 
 The second parameter is `Interval`, clamped to 10 to 5000 milliseconds. The third is `FastResendThreshold`: the number of acknowledgments of later segments after which a segment is retransmitted before its timeout expires, where 0 disables fast retransmission. The fourth disables congestion control, which trades fairness and bandwidth utilization for a stable rate on a lossy link.
 
-The properties behind the parameters can be assigned one at a time as well; `Interval`, `NoDelayLevel`, `FastResendThreshold`, `FastResendLimit` and `NoCongestionControl` are all readable and writable.
+The properties behind the parameters can be assigned one at a time as well; `Interval`, `NoDelayLevel`, `FastResendThreshold`, `FastResendLimit` and `NoCongestionControl` are all readable and writable. `MinimumRoundTripTimeout` is writable too, and must not be negative.
 
 ### Windows
 
@@ -157,7 +157,7 @@ The congestion window is separate: `CongestionWindowSize`, `SlowStartThreshold` 
 kcp.SetMaximumTransmissionUnit(1400);
 ```
 
-The maximum transmission unit limits how many segments are merged into one datagram and how large a fragment is. It must be at least `Constant.MinimumTransmissionUnit`; `HeaderSize` (24 bytes) of it is protocol overhead, which leaves `MaximumSegmentSize` for payload.
+The maximum transmission unit limits how many segments are merged into one datagram and how large a fragment is. It must be at least `Constant.MinimumTransmissionUnit`; `HeaderSize` (24 bytes) of it is protocol overhead, which leaves `MaximumSegmentSize` for payload. A segment keeps the fragment size it was split into, so lowering the maximum transmission unit while segments are still queued or unacknowledged makes those segments leave as datagrams larger than the new limit.
 
 ### Stream Mode
 
@@ -190,7 +190,7 @@ kcp.LogWriter = message => Debug.Log(message);
 
 ## Link Health
 
-A segment that is transmitted `DeadLinkTransmissionCount` times without being acknowledged marks the connection as dead: `State` becomes `uint.MaxValue` and `IsDead` reports `true`. The application decides what to do with it — KCP itself only reports it.
+A segment that is transmitted `DeadLinkTransmissionCount` times without being acknowledged marks the connection as dead: `State` becomes `uint.MaxValue` and `IsDead` reports `true`. The count must be at least 1. The application decides what to do with it — KCP itself only reports it.
 
 ```csharp
 kcp.State;                     // uint.MaxValue once the link is dead

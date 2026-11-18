@@ -8,12 +8,16 @@ namespace Aurora.Kcp
     /// A KCP control block, which implements the KCP ARQ protocol for one connection.
     /// </summary>
     /// <remarks>
+    /// <para>
     /// KCP is a pure algorithm: it neither owns sockets nor reads the clock. The caller supplies the lower layer through a <see cref="KcpOutputHandler"/>,
     /// feeds received datagrams through <see cref="Input"/>, and drives the state machine by calling <see cref="Update"/> with the current time in milliseconds.
-    /// <br/>
+    /// </para>
+    /// <para>
     /// An instance is not thread-safe. All members must be called from the same thread, or in an externally serialized manner.
-    /// <br/>
+    /// </para>
+    /// <para>
     /// The implementation follows the upstream C implementation (kcp v2) closely, so it interoperates with any other KCP implementation.
+    /// </para>
     /// </remarks>
     public sealed class Kcp : IDisposable
     {
@@ -325,8 +329,24 @@ namespace Aurora.Kcp
         /// <summary>
         /// Gets or sets the smallest retransmission timeout in milliseconds.
         /// </summary>
+        /// <exception cref="ArgumentOutOfRangeException">The value is negative.</exception>
         /// <remarks><see cref="NoDelayLevel"/> overwrites this value when it is assigned.</remarks>
-        public int MinimumRoundTripTimeout { get => _minimumRoundTripTimeout; set => _minimumRoundTripTimeout = value; }
+        public int MinimumRoundTripTimeout
+        {
+            get => _minimumRoundTripTimeout;
+            set
+            {
+                if (value < 0)
+                {
+                    throw new ArgumentOutOfRangeException(
+                        nameof(value),
+                        value,
+                        "The minimum round-trip timeout must not be negative."
+                    );
+                }
+                _minimumRoundTripTimeout = value;
+            }
+        }
 
         /// <summary>
         /// Gets the smoothed round-trip time in milliseconds.
@@ -346,10 +366,22 @@ namespace Aurora.Kcp
         /// <summary>
         /// Gets or sets the number of transmissions of a segment after which the link is considered dead.
         /// </summary>
+        /// <exception cref="ArgumentOutOfRangeException">The value is less than 1.</exception>
         public int DeadLinkTransmissionCount
         {
             get => (int)_deadLinkTransmissionCount;
-            set => _deadLinkTransmissionCount = (uint)value;
+            set
+            {
+                if (value < 1)
+                {
+                    throw new ArgumentOutOfRangeException(
+                        nameof(value),
+                        value,
+                        "The dead link transmission count must be at least 1."
+                    );
+                }
+                _deadLinkTransmissionCount = (uint)value;
+            }
         }
 
         /// <summary>
@@ -387,7 +419,7 @@ namespace Aurora.Kcp
                 }
                 if (_congestionControl == null)
                 {
-                    EnsureCongestionWindowIsOpen();
+                    RestoreBuiltInCongestionControl();
                 }
             }
         }
@@ -453,7 +485,15 @@ namespace Aurora.Kcp
         /// </summary>
         /// <param name="maximumTransmissionUnit">The maximum transmission unit in bytes.</param>
         /// <exception cref="ArgumentOutOfRangeException"><paramref name="maximumTransmissionUnit"/> is less than <see cref="Constant.MinimumTransmissionUnit"/>.</exception>
-        /// <remarks>The maximum transmission unit limits how many segments are merged into one datagram and how large a fragment is.</remarks>
+        /// <remarks>
+        /// <para>
+        /// The maximum transmission unit limits how many segments are merged into one datagram and how large a fragment is.
+        /// </para>
+        /// <para>
+        /// A segment keeps the fragment size it was split into, so reducing the maximum transmission unit while segments are still queued or unacknowledged
+        /// makes those segments drain as datagrams that exceed the new maximum transmission unit; the output buffer is enlarged to hold them.
+        /// </para>
+        /// </remarks>
         public void SetMaximumTransmissionUnit(int maximumTransmissionUnit)
         {
             ThrowIfDisposed();
@@ -465,9 +505,14 @@ namespace Aurora.Kcp
                     $"The maximum transmission unit must be at least {Constant.MinimumTransmissionUnit}."
                 );
             }
+            // A datagram that holds a segment queued before the change is as long as the header plus the payload of that segment.
+            var datagramLength = Math.Max(
+                maximumTransmissionUnit,
+                FindLongestQueuedSegmentLength() + Constant.HeaderSize
+            );
             _maximumTransmissionUnit = (uint)maximumTransmissionUnit;
             _maximumSegmentSize      = _maximumTransmissionUnit - Constant.HeaderSize;
-            _outputBuffer            = new byte[(maximumTransmissionUnit + Constant.HeaderSize) * 3];
+            _outputBuffer            = new byte[(datagramLength + Constant.HeaderSize) * 3];
         }
 
         /// <summary>
@@ -487,29 +532,51 @@ namespace Aurora.Kcp
             ThrowIfDisposed();
             ValidateRange(buffer, offset, count);
 
+            var sent = SendCore(buffer, offset, count);
+
+            if (IsLogging(KcpLogMask.Send))
+            {
+                WriteLog(KcpLogMask.Send, $"send: {sent} bytes");
+            }
+            return sent;
+        }
+
+        /// <summary>
+        /// Queues a message, whose arguments <see cref="Send"/> has already validated.
+        /// </summary>
+        /// <param name="buffer">The buffer that contains the message.</param>
+        /// <param name="offset">The zero-based offset of the message in <paramref name="buffer"/>.</param>
+        /// <param name="count">The length of the message in bytes.</param>
+        /// <returns>The number of bytes that have been queued.</returns>
+        private int SendCore(byte[] buffer, int offset, int count)
+        {
             var sent = 0;
 
             // Append to the previous segment in the stream mode when it still has room.
-            if (_streamMode && _sendQueue.Count > 0)
+            if (_streamMode)
             {
-                var previous = _sendQueue.PeekLast();
-                if (previous.Length < _maximumSegmentSize)
+                if (_sendQueue.Count > 0)
                 {
-                    var capacity = (int)_maximumSegmentSize - previous.Length;
-                    var extend   = Math.Min(count, capacity);
-                    var segment  = RentSegment();
-                    segment.EnsureDataCapacity(previous.Length + extend);
-                    Array.Copy(previous.Data, 0,      segment.Data, 0,               previous.Length);
-                    Array.Copy(buffer,        offset, segment.Data, previous.Length, extend);
-                    segment.Length        = previous.Length + extend;
-                    segment.FragmentIndex = 0;
-                    _sendQueue.RemoveAt(_sendQueue.Count - 1);
-                    ReturnSegment(previous);
-                    _sendQueue.EnqueueLast(segment);
-                    offset += extend;
-                    count  -= extend;
-                    sent   =  extend;
+                    var previous = _sendQueue.PeekLast();
+                    if (previous.Length < _maximumSegmentSize)
+                    {
+                        var capacity = (int)_maximumSegmentSize - previous.Length;
+                        var extend   = Math.Min(count, capacity);
+                        var segment  = RentSegment();
+                        segment.EnsureDataCapacity(previous.Length + extend);
+                        Array.Copy(previous.Data, 0,      segment.Data, 0,               previous.Length);
+                        Array.Copy(buffer,        offset, segment.Data, previous.Length, extend);
+                        segment.Length        = previous.Length + extend;
+                        segment.FragmentIndex = 0;
+                        _sendQueue.RemoveAt(_sendQueue.Count - 1);
+                        ReturnSegment(previous);
+                        _sendQueue.EnqueueLast(segment);
+                        offset += extend;
+                        count  -= extend;
+                        sent   =  extend;
+                    }
                 }
+                // In the stream mode an empty message denotes nothing at all, so it must not be fragmented into an empty segment.
                 if (count <= 0)
                 {
                     return sent;
@@ -607,14 +674,45 @@ namespace Aurora.Kcp
                     return KcpInputResult.MalformedSegment;
                 }
 
-                _remoteWindowSize = window;
-                ParseUnacknowledged(unacknowledged);
-                ShrinkSendBuffer();
-
                 switch (command)
                 {
+                    case KcpCommand.Push:
+                        // The next three statements are the same for every valid command.
+                        _remoteWindowSize = window;
+                        ParseUnacknowledged(unacknowledged);
+                        ShrinkSendBuffer();
+
+                        if (IsLogging(KcpLogMask.InputData))
+                        {
+                            WriteLog(
+                                KcpLogMask.InputData,
+                                $"input push: sequence number = {sequenceNumber}, timestamp = {timestamp}"
+                            );
+                        }
+                        if (TimeDifference(sequenceNumber, _receiveNextSequenceNumber + _receiveWindowSize) < 0)
+                        {
+                            PushAcknowledgment(sequenceNumber, timestamp);
+                            if (TimeDifference(sequenceNumber, _receiveNextSequenceNumber) >= 0)
+                            {
+                                var segment = RentSegment();
+                                segment.FragmentIndex  = fragmentIndex;
+                                segment.SequenceNumber = sequenceNumber;
+                                segment.Length         = (int)length;
+                                segment.EnsureDataCapacity((int)length);
+                                if (length > 0)
+                                {
+                                    Array.Copy(buffer, offset, segment.Data, 0, (int)length);
+                                }
+                                ParseData(segment);
+                            }
+                        }
+                        break;
                     case KcpCommand.Acknowledge:
-                    {
+                        // The next three statements are the same for every valid command.
+                        _remoteWindowSize = window;
+                        ParseUnacknowledged(unacknowledged);
+                        ShrinkSendBuffer();
+
                         if (TimeDifference(_currentTime, timestamp) >= 0)
                         {
                             UpdateRoundTripTime(TimeDifference(_currentTime, timestamp));
@@ -642,55 +740,30 @@ namespace Aurora.Kcp
                             );
                         }
                         break;
-                    }
-                    case KcpCommand.Push:
-                    {
-                        if (IsLogging(KcpLogMask.InputData))
-                        {
-                            WriteLog(
-                                KcpLogMask.InputData,
-                                $"input push: sequence number = {sequenceNumber}, timestamp = {timestamp}"
-                            );
-                        }
-                        if (TimeDifference(sequenceNumber, _receiveNextSequenceNumber + _receiveWindowSize) < 0)
-                        {
-                            PushAcknowledgment(sequenceNumber, timestamp);
-                            if (TimeDifference(sequenceNumber, _receiveNextSequenceNumber) >= 0)
-                            {
-                                var segment = RentSegment();
-                                segment.FragmentIndex  = fragmentIndex;
-                                segment.SequenceNumber = sequenceNumber;
-                                segment.Length         = (int)length;
-                                segment.EnsureDataCapacity((int)length);
-                                if (length > 0)
-                                {
-                                    Array.Copy(buffer, offset, segment.Data, 0, (int)length);
-                                }
-                                ParseData(segment);
-                            }
-                        }
-                        break;
-                    }
                     case KcpCommand.WindowProbeAsk:
-                    {
+                        // The next three statements are the same for every valid command.
+                        _remoteWindowSize = window;
+                        ParseUnacknowledged(unacknowledged);
+                        ShrinkSendBuffer();
+
                         // The next flush tells the remote endpoint the local window size.
                         _probeFlags |= AskTell;
                         WriteLog(KcpLogMask.InputProbe, "input probe");
                         break;
-                    }
                     case KcpCommand.WindowProbeTell:
-                    {
+                        // The next three statements are the same for every valid command.
+                        _remoteWindowSize = window;
+                        ParseUnacknowledged(unacknowledged);
+                        ShrinkSendBuffer();
+
                         // The window size has already been stored in the remote window size field.
                         if (IsLogging(KcpLogMask.InputWindowSize))
                         {
                             WriteLog(KcpLogMask.InputWindowSize, $"input window size: {window}");
                         }
                         break;
-                    }
                     default:
-                    {
                         return KcpInputResult.UnknownCommand;
-                    }
                 }
 
                 offset += (int)length;
@@ -822,7 +895,15 @@ namespace Aurora.Kcp
         /// </summary>
         /// <param name="current">The current time in milliseconds.</param>
         /// <exception cref="ObjectDisposedException">The current <see cref="Kcp"/> is disposed.</exception>
-        /// <remarks>Call this method repeatedly (for example every 10 to 100 milliseconds), or call it when <see cref="Check"/> says so.</remarks>
+        /// <remarks>
+        /// <para>
+        /// Call this method repeatedly (for example every 10 to 100 milliseconds), or call it when <see cref="Check"/> says so.
+        /// </para>
+        /// <para>
+        /// The time is a 32 bit counter that is compared modulo 2^32, so any monotonic millisecond counter works, including one that wraps around
+        /// (for example <c>Environment.TickCount</c>); only the difference between two values matters, and it must stay below 2^31 milliseconds.
+        /// </para>
+        /// </remarks>
         public void Update(uint current)
         {
             ThrowIfDisposed();
@@ -833,7 +914,7 @@ namespace Aurora.Kcp
                 _flushTimestamp = _currentTime;
             }
             var elapsed = TimeDifference(_currentTime, _flushTimestamp);
-            if (elapsed >= Constant.TimestampResetThreshold || elapsed < -Constant.TimestampResetThreshold)
+            if (elapsed is >= Constant.TimestampResetThreshold or < -Constant.TimestampResetThreshold)
             {
                 _flushTimestamp = _currentTime;
                 elapsed         = 0;
@@ -855,6 +936,7 @@ namespace Aurora.Kcp
         /// <param name="current">The current time in milliseconds.</param>
         /// <returns>The timestamp at which <see cref="Update"/> should be called, assuming that neither <see cref="Send"/> nor <see cref="Input"/> is called in between.</returns>
         /// <exception cref="ObjectDisposedException">The current <see cref="Kcp"/> is disposed.</exception>
+        /// <remarks>The time is interpreted like the time of <see cref="Update"/>: a 32 bit counter that is compared modulo 2^32.</remarks>
         public uint Check(uint current)
         {
             ThrowIfDisposed();
@@ -940,6 +1022,13 @@ namespace Aurora.Kcp
                     _receiveNextSequenceNumber,
                     0
                 );
+                if (IsLogging(KcpLogMask.OutputAcknowledgment))
+                {
+                    WriteLog(
+                        KcpLogMask.OutputAcknowledgment,
+                        $"output acknowledgment: sequence number = {_acknowledgmentList[i * 2]}"
+                    );
+                }
             }
             _acknowledgmentCount = 0;
 
@@ -979,6 +1068,10 @@ namespace Aurora.Kcp
                     OutputDatagram(buffer, offset);
                     offset = 0;
                 }
+                /*
+                 * The reference implementation leaves the timestamp and the sequence number of the last acknowledgment in a probe header.
+                 * Neither field carries a meaning for a probe, so they are written as zero instead of as leftovers of another segment.
+                 */
                 offset = WriteHeader(
                     buffer,
                     offset,
@@ -1213,7 +1306,7 @@ namespace Aurora.Kcp
 
             if (_congestionControl == null)
             {
-                EnsureCongestionWindowIsOpen();
+                EnsureCongestionWindowIsOpenAfterFlush();
             }
         }
 
@@ -1290,6 +1383,61 @@ namespace Aurora.Kcp
         }
 
         /// <summary>
+        /// Applies the end-of-flush correction of the built-in congestion control, which keeps the window open after it has been collapsed.
+        /// </summary>
+        private void EnsureCongestionWindowIsOpenAfterFlush()
+        {
+            if (_congestionWindowSize < 1)
+            {
+                _congestionWindowSize      = 1;
+                _congestionWindowIncrement = _maximumSegmentSize;
+            }
+        }
+
+        /// <summary>
+        /// Restores the built-in congestion control after a pluggable one has been removed, or after a pluggable one has failed to initialize.
+        /// </summary>
+        private void RestoreBuiltInCongestionControl()
+        {
+            if (_congestionWindowSize < 1)
+            {
+                _congestionWindowSize = 1;
+            }
+            _congestionWindowIncrement = _congestionWindowSize * _maximumSegmentSize;
+            if (_congestionWindowIncrement < _maximumSegmentSize)
+            {
+                _congestionWindowIncrement = _maximumSegmentSize;
+            }
+        }
+
+        /// <summary>
+        /// Finds the payload length of the longest segment that is queued for sending or has been sent but is not acknowledged yet.
+        /// </summary>
+        /// <returns>The payload length in bytes, or 0 if no such segment exists.</returns>
+        /// <remarks>A flush writes a segment into the output buffer whenever the datagram it belongs to is started, so the buffer must be able to hold the longest one.</remarks>
+        private int FindLongestQueuedSegmentLength()
+        {
+            var longest = 0;
+            for (var i = 0; i < _sendQueue.Count; i++)
+            {
+                var length = _sendQueue[i].Length;
+                if (length > longest)
+                {
+                    longest = length;
+                }
+            }
+            for (var i = 0; i < _sendBuffer.Count; i++)
+            {
+                var length = _sendBuffer[i].Length;
+                if (length > longest)
+                {
+                    longest = length;
+                }
+            }
+            return longest;
+        }
+
+        /// <summary>
         /// The built-in congestion control: slow start, then congestion avoidance with the increment based on the maximum segment size.
         /// </summary>
         private void GrowCongestionWindow()
@@ -1321,18 +1469,6 @@ namespace Aurora.Kcp
             {
                 _congestionWindowSize      = _remoteWindowSize;
                 _congestionWindowIncrement = _remoteWindowSize * _maximumSegmentSize;
-            }
-        }
-
-        private void EnsureCongestionWindowIsOpen()
-        {
-            if (_congestionWindowSize < 1)
-            {
-                _congestionWindowSize = 1;
-            }
-            if (_congestionWindowIncrement < _maximumSegmentSize)
-            {
-                _congestionWindowIncrement = _maximumSegmentSize;
             }
         }
 
@@ -1381,12 +1517,18 @@ namespace Aurora.Kcp
                     _acknowledgedLength += segment.Length;
                     if (_congestionControl != null)
                     {
+                        var roundTripTime = TimeDifference(_currentTime, segment.Timestamp);
+                        if (roundTripTime < 0)
+                        {
+                            // The contract of the interface reports a timestamp from the future as -1 rather than as a negative round-trip time.
+                            roundTripTime = -1;
+                        }
                         _congestionControl.OnSegmentAcknowledged(
                             this,
                             segment.SequenceNumber,
                             segment.Timestamp,
                             segment.Length,
-                            TimeDifference(_currentTime, segment.Timestamp),
+                            roundTripTime,
                             segment.TransmissionCount
                         );
                     }

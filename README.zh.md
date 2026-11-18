@@ -1,10 +1,10 @@
 # Aurora KCP
 
 ![许可](https://img.shields.io/github/license/NOMOAX/aurora.kcp)
-![版本](https://img.shields.io/badge/version-0.1.0-blue)
+![版本](https://img.shields.io/badge/version-0.1.1-blue)
 ![最低 Unity 版本](https://img.shields.io/badge/Unity-2021.2%2B-blue)
 
-KCP 是一个快速可靠的 ARQ（Automatic Repeat reQuest）协议：它用 10%-20% 的额外带宽换取比 TCP 低 30%-40% 的平均延迟。
+KCP 是一个快速可靠的自动重传请求（ARQ, Automatic Repeat reQuest）协议：它用 10%-20% 的额外带宽换取比 TCP 低 30%-40% 的平均延迟。
 
 [English](README.md) | 中文
 
@@ -139,7 +139,7 @@ kcp.SetNoDelay(KcpNoDelayLevel.Enabled, 10, 2, true);
 
 第二个参数是 `Interval`，被限制在 10 到 5000 毫秒之间。第三个是 `FastResendThreshold`：后续分段被确认多少个之后，就在超时之前重传本分段；0 表示关闭快速重传。第四个参数关闭拥塞控制，用公平性与带宽利用率为代价，换取在丢包链路上稳定的发送速率。
 
-这些参数背后的属性也可以单独赋值：`Interval`、`NoDelayLevel`、`FastResendThreshold`、`FastResendLimit` 与 `NoCongestionControl` 都可读可写。
+这些参数背后的属性也可以单独赋值：`Interval`、`NoDelayLevel`、`FastResendThreshold`、`FastResendLimit` 与 `NoCongestionControl` 都可读可写。`MinimumRoundTripTimeout` 同样可写，且不能为负。
 
 ### 窗口
 
@@ -157,7 +157,7 @@ kcp.SetWindowSize(32, 128);
 kcp.SetMaximumTransmissionUnit(1400);
 ```
 
-最大传输单元限制一个数据报能合并多少个分段，以及单个分片的大小。它不能小于 `Constant.MinimumTransmissionUnit`；其中 `HeaderSize`（24 字节）是协议开销，其余留给载荷，即 `MaximumSegmentSize`。
+最大传输单元限制一个数据报能合并多少个分段，以及单个分片的大小。它不能小于 `Constant.MinimumTransmissionUnit`；其中 `HeaderSize`（24 字节）是协议开销，其余留给载荷，即 `MaximumSegmentSize`。分段会保持它被分片时的尺寸，因此在仍有分段排队或未确认时调低最大传输单元，这些分段仍会以超过新上限的数据报发出。
 
 ### 流模式
 
@@ -190,7 +190,7 @@ kcp.LogWriter = message => Debug.Log(message);
 
 ## 链路健康
 
-某个分段被发送 `DeadLinkTransmissionCount` 次仍未被确认时，连接被判为已死：`State` 变成 `uint.MaxValue`，`IsDead` 返回 `true`。如何处理由应用决定——KCP 只负责报告。
+某个分段被发送 `DeadLinkTransmissionCount` 次仍未被确认时，连接被判为已死：`State` 变成 `uint.MaxValue`，`IsDead` 返回 `true`。该次数至少为 1。如何处理由应用决定——KCP 只负责报告。
 
 ```csharp
 kcp.State;                     // 链路死亡后为 uint.MaxValue

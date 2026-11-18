@@ -4,11 +4,14 @@ namespace Aurora.Kcp
     /// A pluggable congestion control algorithm of a KCP connection.
     /// </summary>
     /// <remarks>
+    /// <para>
     /// The built-in (NewReno-like) algorithm is used while <see cref="Kcp.CongestionControl"/> is <see langword="null"/>.
     /// Installing an implementation disables the built-in algorithm, and the implementation becomes responsible for maintaining
     /// <see cref="Kcp.CongestionWindowSize"/>, <see cref="Kcp.SlowStartThreshold"/> and <see cref="Kcp.CongestionWindowIncrement"/>.
-    /// <br/>
+    /// </para>
+    /// <para>
     /// The methods are called from within <see cref="Kcp.Input"/>, <see cref="Kcp.Flush"/> and <see cref="Kcp.Update"/>, so they must not allocate or block.
+    /// </para>
     /// </remarks>
     public interface IKcpCongestionControl
     {

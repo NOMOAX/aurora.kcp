@@ -41,6 +41,7 @@ namespace Aurora.Kcp
         /// <summary>
         /// The index of the fragment in its message, counted backwards from the last fragment (0 is the last fragment).
         /// </summary>
+        /// <remarks>The receiver uses the index to delimit messages, and the protocol stores it in eight bits, so a message never has more fragments than <see cref="Constant.MaximumFragmentCount"/>; the receive window imposes a lower limit, which <see cref="Kcp.Send"/> enforces.</remarks>
         internal byte FragmentIndex;
 
         /// <summary>
